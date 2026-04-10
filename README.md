@@ -1,33 +1,39 @@
 # Link Extractor
 
-A native macOS app (Apple Silicon) that pulls every hyperlink out of a document and exports them to an Excel workbook — no subscriptions, no cloud, no external dependencies.
+A native macOS app (Apple Silicon) that pulls every hyperlink out of a document and exports them to Excel or CSV — no subscriptions, no cloud, no external dependencies.
 
-Drop in a `.pdf`, `.docx`, or `.pages` file (or several at once), review the extracted URLs, and export directly to `.xlsx` with one click.
+Drop in `.pdf`, `.docx`, `.pages`, `.html`, or `.rtf` files (or several at once), review the extracted URLs with source info and anchor text, and export with one click.
 
 ---
 
 ## Features
 
+- **5 file formats** — PDF, Word (.docx), Pages, HTML, and RTF
 - **Multi-file batch mode** — load several documents at once; each file becomes its own sheet in the exported workbook
-- **Drag & drop or file picker** — drop files anywhere on the window, or use the file chooser
-- **Live search / filter** — type to instantly narrow down hundreds of URLs
-- **Duplicate removal** — optional global dedup across all loaded files
-- **Clipboard copy** — copy selected URLs as newline-separated text with one click
-- **Right-click context menu** — Copy URL or Open in Browser on any row
-- **Excel export** — blue underlined hyperlink style, 90-unit column width, one sheet per source file
+- **Source tracking** — every URL shows which file (and page number for PDFs) it came from
+- **Anchor text extraction** — for `.docx` and `.html` files, captures the display text of each hyperlink
+- **Dual export** — Excel (.xlsx) with bold headers and blue hyperlink styling, or CSV with a File column
+- **Duplicate highlighting** — toggle between removing duplicates or highlighting them in orange
+- **Live search** — filter by URL, source, or anchor text in real time
+- **Right-click context menu** — Copy URL, Copy Anchor Text, Open in Browser
+- **Clipboard copy** — copy all selected URLs as newline-separated text
+- **Resizable window** — drag to resize; minimum 520x480, default 620x680
+- **Drag & drop** — drop files anywhere on the window
 - **Zero dependencies** — only Apple frameworks (`SwiftUI`, `PDFKit`, `Foundation`, `AppKit`)
 
 ---
 
 ## Supported Formats
 
-| Format | Extraction method |
-|---|---|
-| `.pdf` | PDFKit annotations (`PDFActionURL`) + page-text regex scan |
-| `.docx` | Unzip → `word/_rels/document.xml.rels` hyperlinks + full XML regex scan |
-| `.pages` | Unzip → embedded `preview.pdf` via PDFKit + binary regex scan of `.iwa` protobuf blobs |
+| Format | Extraction method | Source tracking | Anchor text |
+|---|---|---|---|
+| `.pdf` | PDFKit annotations + page-text regex | Filename + page number | -- |
+| `.docx` | Unzip -> `document.xml.rels` hyperlinks + `<w:hyperlink>` parsing | Filename | Display text from `<w:t>` elements |
+| `.pages` | Unzip -> embedded `preview.pdf` + binary regex on `.iwa` blobs | Filename + page number | -- |
+| `.html` / `.htm` | `<a href>` tag parsing + raw URL regex | Filename | Inner text of `<a>` tags |
+| `.rtf` | `NSAttributedString` `.link` attributes + `HYPERLINK` regex fallback | Filename | Link display text |
 
-All three share a common regex pass for raw URLs in text:
+All formats share a common regex pass for raw URLs:
 
 ```
 https?://[^\s<>"'\]\[}{|\\^`\x00-\x1F]+
@@ -70,7 +76,7 @@ The script:
 3. Writes `Info.plist` and strips the quarantine attribute
 4. Prompts to launch immediately
 
-Compilation takes 15–30 seconds on first run.
+Compilation takes 15-30 seconds on first run.
 
 ---
 
@@ -78,29 +84,48 @@ Compilation takes 15–30 seconds on first run.
 
 ### Loading files
 
-- **Drag and drop** — drag one or more `.pdf`, `.docx`, or `.pages` files anywhere onto the window
-- **File picker** — click **Choose Files…** (or **Add Files…** once files are loaded) to open a multi-select panel
+- **Drag and drop** — drag one or more supported files anywhere onto the window
+- **File picker** — click **Choose Files...** (or **Add Files...** once files are loaded) to open a multi-select panel
 
-Each loaded file appears as a chip showing its name and link count. Click **×** on a chip to remove that file and its links.
+Each loaded file appears as a chip showing its name, format color, and link count. Click **x** on a chip to remove it.
 
 ### Reviewing URLs
 
-- Check/uncheck individual rows to include or exclude them from export
-- Use **All** / **None** to select or deselect everything visible
-- Toggle **Remove duplicates** to deduplicate across all loaded files
-- Type in the **search bar** to filter the list in real time — selection state is preserved for hidden rows
-- **Right-click** any URL row for:
-  - **Copy URL** — copies the single URL to the clipboard
-  - **Open in Browser** — opens it in your default browser
+Each row displays:
+- The URL (blue monospace)
+- Source info (filename, page number for PDFs)
+- Anchor text when available (the display text of the original hyperlink)
+
+Controls:
+- **Check/uncheck** rows to include or exclude them from export
+- **All / None** buttons to bulk-select or deselect visible links
+- **Remove duplicates** toggle — ON removes dupes globally; OFF highlights them with an orange "dupe" badge and tinted background
+- **Search bar** — filters by URL, source, or anchor text; selection state is preserved for hidden rows
+
+Right-click any row for:
+- **Copy URL** — single URL to clipboard
+- **Copy Anchor Text** — if the link has display text
+- **Open in Browser** — opens in your default browser
 
 ### Exporting
 
-| Action | Button |
-|---|---|
-| Export to Excel | **Export to Excel (.xlsx)…** — opens a Save panel; creates one sheet per file |
-| Copy to clipboard | **Copy** — copies all selected *visible* URLs as newline-separated text |
+| Action | Button | Output |
+|---|---|---|
+| Excel export | **Export .xlsx...** | One sheet per file, 3 columns: URL (blue hyperlink), Source, Anchor Text |
+| CSV export | **Export .csv...** | All links in one file, 4 columns: URL, Source, Anchor Text, File |
+| Clipboard | **Copy** | Selected visible URLs, newline-separated |
 
-When exporting multiple files, the workbook sheet names are derived from the source filenames (truncated to Excel's 31-character limit, deduplicated if filenames collide).
+Excel workbook sheet names are derived from source filenames (truncated to 31 chars, auto-deduplicated on collision).
+
+---
+
+## Excel Output Format
+
+Each sheet includes:
+- **Row 1** — Bold headers: URL | Source | Anchor Text
+- **Column A** — URLs in blue underlined Calibri 11pt (width: 80)
+- **Column B** — Source reference (width: 35)
+- **Column C** — Anchor text when available (width: 50)
 
 ---
 
@@ -108,7 +133,7 @@ When exporting multiple files, the workbook sheet names are derived from the sou
 
 ```
 linkextractor/
-├── LinkExtractor.swift   ← entire app (~570 lines, single file)
+├── LinkExtractor.swift   ← entire app (~830 lines, single file)
 └── build.sh              ← compiler script + app bundle assembly
 ```
 
@@ -116,26 +141,35 @@ linkextractor/
 
 ```
 Models
-  ExtractedLink   { id: UUID, url: String }
-  LoadedFile      { id: UUID, url: URL, name, type, links: [ExtractedLink] }
+  RawLink           { url, source, anchorText }        — extractor/writer interchange
+  ExtractedLink     { id, url, source, anchorText }    — UI model with UUID
+  LoadedFile        { id, url, name, type, links }
 
-Extractors  (pure static structs)
-  DocxExtractor   → unzip → parse .rels XML + regex scan
-  PDFExtractor    → PDFKit annotations + page-text regex
-  PagesExtractor  → preview.pdf via PDFKit + binary regex on .iwa blobs
+Extractors  (pure static structs, return [RawLink])
+  DocxExtractor     → unzip → rId map + <w:hyperlink> anchor text + regex scan
+  PDFExtractor      → PDFKit annotations + page-text regex (with page numbers)
+  PagesExtractor    → preview.pdf via PDFExtractor + binary regex on .iwa blobs
+  HtmlExtractor     → <a href> tag parsing + entity decoding + raw URL scan
+  RtfExtractor      → NSAttributedString .link attrs + HYPERLINK regex fallback
 
-XLSXWriter        → builds Office Open XML tree in temp dir → /usr/bin/zip → .xlsx
+Writers
+  XLSXWriter        → Office Open XML with 3 columns, headers, 3 cell styles
+  CSVWriter          → RFC 4180 CSV with 4 columns (URL, Source, Anchor Text, File)
 
-AppState          → ObservableObject; holds loadedFiles, selection, search, dedup
-  loadFiles(_:)   → background extraction; appends LoadedFile per URL
-  copySelected()  → NSPasteboard
-  export()        → XLSXWriter, one sheet per LoadedFile
+AppState            → ObservableObject; loadedFiles, selection, search, dedup
+  loadFiles(_:)     → background extraction → [LoadedFile]
+  export()          → XLSXWriter, one sheet per file
+  exportCSV()       → CSVWriter, all files in one CSV
+  copySelected()    → NSPasteboard
+  buildSheets()     → shared sheet builder for both export paths
 
-FileDrop          → DropDelegate; collects multiple dropped files via DispatchGroup
-LinkRow           → checkbox row + context menu (Copy URL, Open in Browser)
-DropZone          → dashed-border drop target shown when no files loaded
-ContentView       → root view: file chips, search bar, URL list, export bar
-AppDelegate       → NSWindow 560×620, hosts NSHostingView<ContentView>
+Views
+  FileDrop          → DropDelegate; multi-file collection via DispatchGroup
+  LinkRow           → URL + source + anchor text + dupe highlight + context menu
+  DropZone          → dashed-border drop target
+  Badge             → colored pill label
+  ContentView       → file chips, search bar, URL list, export bar (resizable)
+  AppDelegate       → NSWindow 620x680, resizable, min 520x480
 ```
 
 ---
@@ -144,29 +178,34 @@ AppDelegate       → NSWindow 560×620, hosts NSHostingView<ContentView>
 
 Notes doesn't export hyperlinks cleanly. Best paths:
 
-1. **Notes → PDF** *(quickest)*  
-   File › Print › Save as PDF → drop into Link Extractor  
-   *(works if links are clickable in Notes)*
+1. **Notes -> PDF** *(quickest)*
+   File > Print > Save as PDF -> drop into Link Extractor
 
-2. **Notes → Pages → PDF**  
-   Copy note content → paste into a new Pages doc → File › Export To › PDF → drop in
+2. **Notes -> Pages -> PDF**
+   Copy note content -> paste into a new Pages doc -> File > Export To > PDF -> drop in
 
-3. **Notes → HTML** *(best for bulk, macOS Sonoma+)*  
-   File › Export All Notes → produces `.html` files  
-   *(HTML support is a planned future upgrade)*
+3. **Notes -> HTML** *(best for bulk, macOS Sonoma+)*
+   File > Export All Notes -> produces `.html` files -> drop them directly into Link Extractor
 
 ---
 
-## Planned Upgrades
+## Changelog
 
-- [ ] Source column in xlsx (filename + page number for PDFs)
-- [ ] Anchor text extraction for `.docx` hyperlinks
-- [ ] HTML / `.htm` support (`<a href>` parsing)
-- [ ] RTF support (`\fldinst HYPERLINK` patterns)
-- [ ] PDF page number tracking
-- [ ] Resizable window
-- [ ] CSV export alternative
-- [ ] Duplicate highlighting (color instead of remove)
+### v2.0
+- HTML (.html, .htm) and RTF (.rtf) format support
+- Source column in exports (filename + page number for PDFs)
+- Anchor text extraction for .docx and .html hyperlinks
+- RTF extraction via NSAttributedString + HYPERLINK regex
+- CSV export alternative alongside Excel
+- Duplicate highlighting with orange badges when dedup is off
+- Resizable window (min 520x480, default 620x680)
+- 3-column Excel output with bold headers (URL, Source, Anchor Text)
+- Search now covers URL, source, and anchor text fields
+
+### v1.0
+- Initial release with PDF, Word, and Pages support
+- Multi-file batch mode, search/filter, clipboard copy
+- Right-click context menu, drag and drop
 
 ---
 

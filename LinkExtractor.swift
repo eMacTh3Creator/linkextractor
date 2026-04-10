@@ -1,6 +1,6 @@
 // LinkExtractor.swift
 // Native Apple Silicon SwiftUI app
-// Extracts hyperlinks from .docx / .pdf / .pages → exports to .xlsx
+// Extracts hyperlinks from .docx / .pdf / .pages / .html / .rtf → exports to .xlsx or .csv
 // No external dependencies. Compile with build.sh.
 
 import AppKit
@@ -13,9 +13,19 @@ import UniformTypeIdentifiers
 // MARK: - Models
 // ═══════════════════════════════════════════════════════════════════════════
 
+/// Lightweight link data used by extractors and writers.
+struct RawLink {
+    let url        : String
+    let source     : String   // e.g. "report.pdf, Page 3"
+    let anchorText : String   // display text of the hyperlink (empty if none)
+}
+
+/// UI model with identity for SwiftUI list / selection.
 struct ExtractedLink: Identifiable, Hashable {
-    let id  = UUID()
-    let url : String
+    let id         = UUID()
+    let url        : String
+    let source     : String
+    let anchorText : String
 
     func hash(into hasher: inout Hasher) { hasher.combine(url) }
     static func == (a: ExtractedLink, b: ExtractedLink) -> Bool { a.url == b.url }
@@ -30,10 +40,9 @@ struct LoadedFile: Identifiable {
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
-// MARK: - URL Extractors
+// MARK: - URL Extractors — shared helpers
 // ═══════════════════════════════════════════════════════════════════════════
 
-// Regex that matches http(s):// URLs — used for .pages and fallback
 private let urlPattern = try! NSRegularExpression(
     pattern: #"https?://[^\s<>"'\]\[}{|\\^`\x00-\x1F]+"#,
     options: []
@@ -49,41 +58,81 @@ private func extractURLsFromText(_ text: String) -> [String] {
         .filter { !$0.isEmpty }
 }
 
+private func decodeHtmlEntities(_ s: String) -> String {
+    s.replacingOccurrences(of: "&amp;",  with: "&")
+     .replacingOccurrences(of: "&lt;",   with: "<")
+     .replacingOccurrences(of: "&gt;",   with: ">")
+     .replacingOccurrences(of: "&quot;", with: "\"")
+     .replacingOccurrences(of: "&#39;",  with: "'")
+     .replacingOccurrences(of: "&apos;", with: "'")
+}
+
 // ── DOCX ─────────────────────────────────────────────────────────────────────
 
 struct DocxExtractor {
-    static func extract(from url: URL) throws -> [String] {
+    static func extract(from url: URL) throws -> [RawLink] {
         let fm  = FileManager.default
         let tmp = fm.temporaryDirectory.appendingPathComponent(UUID().uuidString)
         defer { try? fm.removeItem(at: tmp) }
         try fm.createDirectory(at: tmp, withIntermediateDirectories: true)
 
-        // Unzip using /usr/bin/unzip
         let proc = Process()
-        proc.executableURL       = URL(fileURLWithPath: "/usr/bin/unzip")
-        proc.arguments           = ["-q", url.path, "-d", tmp.path]
-        proc.standardOutput      = Pipe()
-        proc.standardError       = Pipe()
+        proc.executableURL  = URL(fileURLWithPath: "/usr/bin/unzip")
+        proc.arguments      = ["-q", url.path, "-d", tmp.path]
+        proc.standardOutput = Pipe()
+        proc.standardError  = Pipe()
         try proc.run()
         proc.waitUntilExit()
 
-        var links: [String] = []
+        let filename = url.lastPathComponent
+        var links: [RawLink] = []
 
-        // 1. Parse word/_rels/document.xml.rels for explicit hyperlinks
+        // 1. Build rId → URL map from rels
+        var relMap: [String: String] = [:]
         let relsURL = tmp.appendingPathComponent("word/_rels/document.xml.rels")
         if let relsData = try? Data(contentsOf: relsURL),
            let relsStr  = String(data: relsData, encoding: .utf8) {
-            links += parseRels(relsStr)
+            relMap = parseRelsMap(relsStr)
         }
 
-        // 2. Also scan word/document.xml for any raw URLs in text runs
+        // 2. Parse document.xml for hyperlinks with anchor text
         let docURL = tmp.appendingPathComponent("word/document.xml")
         if let docData = try? Data(contentsOf: docURL),
            let docStr  = String(data: docData, encoding: .utf8) {
-            links += extractURLsFromText(docStr)
+
+            // Extract <w:hyperlink r:id="X"> with <w:t> text inside
+            let hyperlinks = parseHyperlinks(docStr, relMap: relMap, filename: filename)
+            var urlToAnchor: [String: String] = [:]
+            for hl in hyperlinks where !hl.anchorText.isEmpty {
+                urlToAnchor[hl.url] = hl.anchorText
+            }
+
+            // Add rels URLs (with anchor text if we found one)
+            for (_, urlStr) in relMap {
+                let anchor = urlToAnchor[urlStr] ?? ""
+                links.append(RawLink(url: urlStr, source: filename, anchorText: anchor))
+            }
+
+            // Add any hyperlinks with inline URLs not covered by rels
+            let relsURLs = Set(relMap.values)
+            for hl in hyperlinks where !relsURLs.contains(hl.url) {
+                links.append(hl)
+            }
+
+            // Raw URL scan of document.xml
+            let existing = Set(links.map(\.url))
+            for rawURL in extractURLsFromText(docStr) where !existing.contains(rawURL) {
+                links.append(RawLink(url: rawURL, source: filename, anchorText: ""))
+            }
+        } else {
+            // Fallback: just add rels URLs
+            for (_, urlStr) in relMap {
+                links.append(RawLink(url: urlStr, source: filename, anchorText: ""))
+            }
         }
 
-        // 3. Scan all other XML files (headers, footers, endnotes, etc.)
+        // 3. Scan other XML files (headers, footers, endnotes)
+        let existing2 = Set(links.map(\.url))
         if let enumerator = fm.enumerator(at: tmp, includingPropertiesForKeys: nil) {
             for case let fileURL as URL in enumerator {
                 let p = fileURL.path
@@ -92,7 +141,9 @@ struct DocxExtractor {
                       !p.contains("document.xml.rels") else { continue }
                 if let data = try? Data(contentsOf: fileURL),
                    let str  = String(data: data, encoding: .utf8) {
-                    links += extractURLsFromText(str)
+                    for rawURL in extractURLsFromText(str) where !existing2.contains(rawURL) {
+                        links.append(RawLink(url: rawURL, source: filename, anchorText: ""))
+                    }
                 }
             }
         }
@@ -100,18 +151,45 @@ struct DocxExtractor {
         return links
     }
 
-    // Parse Target="http..." from a .rels XML file
-    private static func parseRels(_ xml: String) -> [String] {
-        var results: [String] = []
-        let pattern = try! NSRegularExpression(
-            pattern: #"Target="(https?://[^"]+)""#, options: [])
+    /// Build rId → URL map from a .rels file (attribute order–independent).
+    private static func parseRelsMap(_ xml: String) -> [String: String] {
+        var map: [String: String] = [:]
+        let relPattern    = try! NSRegularExpression(pattern: #"<Relationship\s[^>]+>"#, options: [])
+        let idPattern     = try! NSRegularExpression(pattern: #"Id="([^"]+)""#, options: [])
+        let targetPattern = try! NSRegularExpression(pattern: #"Target="(https?://[^"]+)""#, options: [])
         let ns = xml as NSString
-        for match in pattern.matches(in: xml, range: NSRange(location: 0, length: ns.length)) {
-            if match.numberOfRanges > 1 {
-                let range = match.range(at: 1)
-                let url   = ns.substring(with: range)
-                results.append(url)
+        for m in relPattern.matches(in: xml, range: NSRange(location: 0, length: ns.length)) {
+            let tag   = ns.substring(with: m.range)
+            let tagNS = tag as NSString
+            let r     = NSRange(location: 0, length: tagNS.length)
+            guard let idM = idPattern.firstMatch(in: tag, range: r),
+                  let tM  = targetPattern.firstMatch(in: tag, range: r) else { continue }
+            map[tagNS.substring(with: idM.range(at: 1))] = tagNS.substring(with: tM.range(at: 1))
+        }
+        return map
+    }
+
+    /// Extract <w:hyperlink r:id="X"> with inner <w:t> text.
+    private static func parseHyperlinks(_ xml: String, relMap: [String: String], filename: String) -> [RawLink] {
+        var results: [RawLink] = []
+        let hlPattern   = try! NSRegularExpression(
+            pattern: #"<w:hyperlink[^>]*r:id="([^"]+)"[^>]*>(.*?)</w:hyperlink>"#,
+            options: [.dotMatchesLineSeparators])
+        let textPattern = try! NSRegularExpression(
+            pattern: #"<w:t[^>]*>(.*?)</w:t>"#,
+            options: [.dotMatchesLineSeparators])
+        let ns = xml as NSString
+        for m in hlPattern.matches(in: xml, range: NSRange(location: 0, length: ns.length)) {
+            guard m.numberOfRanges > 2 else { continue }
+            let rId  = ns.substring(with: m.range(at: 1))
+            let body = ns.substring(with: m.range(at: 2))
+            guard let url = relMap[rId] else { continue }
+            var texts: [String] = []
+            let bodyNS = body as NSString
+            for tm in textPattern.matches(in: body, range: NSRange(location: 0, length: bodyNS.length)) {
+                if tm.numberOfRanges > 1 { texts.append(bodyNS.substring(with: tm.range(at: 1))) }
             }
+            results.append(RawLink(url: url, source: filename, anchorText: texts.joined()))
         }
         return results
     }
@@ -120,34 +198,35 @@ struct DocxExtractor {
 // ── PDF ──────────────────────────────────────────────────────────────────────
 
 struct PDFExtractor {
-    static func extract(from url: URL) throws -> [String] {
+    static func extract(from url: URL) throws -> [RawLink] {
         guard let doc = PDFDocument(url: url) else {
             throw NSError(domain: "PDFExtractor", code: 1,
                           userInfo: [NSLocalizedDescriptionKey: "Could not open PDF."])
         }
 
-        var links: [String] = []
+        let filename = url.lastPathComponent
+        var links: [RawLink] = []
 
         for pageIndex in 0..<doc.pageCount {
             guard let page = doc.page(at: pageIndex) else { continue }
+            let source = "\(filename), Page \(pageIndex + 1)"
 
-            // 1. Named annotations with URLs
             for annotation in page.annotations {
                 if let dest = annotation.url {
                     let s = dest.absoluteString
-                    if s.hasPrefix("http") { links.append(s) }
+                    if s.hasPrefix("http") { links.append(RawLink(url: s, source: source, anchorText: "")) }
                 }
-                // Some PDFs store URLs as action strings
                 if let action = annotation.action as? PDFActionURL,
                    let actionURL = action.url {
                     let s = actionURL.absoluteString
-                    if s.hasPrefix("http") { links.append(s) }
+                    if s.hasPrefix("http") { links.append(RawLink(url: s, source: source, anchorText: "")) }
                 }
             }
 
-            // 2. Scan page text for raw URLs (covers text-as-hyperlink PDFs)
             if let text = page.string {
-                links += extractURLsFromText(text)
+                for rawURL in extractURLsFromText(text) {
+                    links.append(RawLink(url: rawURL, source: source, anchorText: ""))
+                }
             }
         }
 
@@ -158,13 +237,12 @@ struct PDFExtractor {
 // ── PAGES ────────────────────────────────────────────────────────────────────
 
 struct PagesExtractor {
-    static func extract(from url: URL) throws -> [String] {
+    static func extract(from url: URL) throws -> [RawLink] {
         let fm  = FileManager.default
         let tmp = fm.temporaryDirectory.appendingPathComponent(UUID().uuidString)
         defer { try? fm.removeItem(at: tmp) }
         try fm.createDirectory(at: tmp, withIntermediateDirectories: true)
 
-        // Unzip the .pages bundle
         let proc = Process()
         proc.executableURL  = URL(fileURLWithPath: "/usr/bin/unzip")
         proc.arguments      = ["-q", url.path, "-d", tmp.path]
@@ -173,27 +251,35 @@ struct PagesExtractor {
         try proc.run()
         proc.waitUntilExit()
 
-        var links: [String] = []
+        let filename = url.lastPathComponent
+        var links: [RawLink] = []
 
-        // Strategy 1: If there's a preview.pdf inside, use PDFExtractor on it
+        // Strategy 1: preview.pdf — use PDFExtractor, re-source to .pages filename
         let previewPDF = tmp.appendingPathComponent("preview.pdf")
         if fm.fileExists(atPath: previewPDF.path) {
-            links += (try? PDFExtractor.extract(from: previewPDF)) ?? []
+            let pdfLinks = (try? PDFExtractor.extract(from: previewPDF)) ?? []
+            links += pdfLinks.map {
+                RawLink(url: $0.url,
+                        source: $0.source.replacingOccurrences(of: "preview.pdf", with: filename),
+                        anchorText: $0.anchorText)
+            }
         }
 
-        // Strategy 2: Scan ALL files (including .iwa protobuf blobs) for URL byte patterns
-        // URLs are stored as UTF-8 strings inside protobuf, readable via regex
+        // Strategy 2: Scan all files for URL byte patterns
+        let existingURLs = Set(links.map(\.url))
         if let enumerator = fm.enumerator(at: tmp, includingPropertiesForKeys: nil) {
             for case let fileURL as URL in enumerator {
                 guard !fileURL.hasDirectoryPath else { continue }
                 guard let data = try? Data(contentsOf: fileURL) else { continue }
 
-                // Try as UTF-8 text
                 if let text = String(data: data, encoding: .utf8) {
-                    links += extractURLsFromText(text)
+                    for rawURL in extractURLsFromText(text) where !existingURLs.contains(rawURL) {
+                        links.append(RawLink(url: rawURL, source: filename, anchorText: ""))
+                    }
                 } else {
-                    // Scan binary data for UTF-8 URL sequences
-                    links += extractURLsFromBinaryData(data)
+                    for rawURL in extractURLsFromBinaryData(data) where !existingURLs.contains(rawURL) {
+                        links.append(RawLink(url: rawURL, source: filename, anchorText: ""))
+                    }
                 }
             }
         }
@@ -201,14 +287,114 @@ struct PagesExtractor {
         return links
     }
 
-    // Finds ASCII URL strings embedded in binary data (protobuf blobs)
     private static func extractURLsFromBinaryData(_ data: Data) -> [String] {
-        // Convert printable ASCII bytes to a lossy string and scan
         let ascii = data.map { byte -> UInt8 in
-            (byte >= 0x20 && byte < 0x7f) ? byte : 0x20  // replace non-printable with space
+            (byte >= 0x20 && byte < 0x7f) ? byte : 0x20
         }
         let str = String(bytes: ascii, encoding: .ascii) ?? ""
         return extractURLsFromText(str)
+    }
+}
+
+// ── HTML ─────────────────────────────────────────────────────────────────────
+
+struct HtmlExtractor {
+    static func extract(from url: URL) throws -> [RawLink] {
+        guard let data = try? Data(contentsOf: url) else {
+            throw NSError(domain: "HtmlExtractor", code: 1,
+                          userInfo: [NSLocalizedDescriptionKey: "Could not read HTML file."])
+        }
+        guard let html = String(data: data, encoding: .utf8)
+                      ?? String(data: data, encoding: .isoLatin1) else {
+            throw NSError(domain: "HtmlExtractor", code: 2,
+                          userInfo: [NSLocalizedDescriptionKey: "Unsupported text encoding."])
+        }
+
+        let filename = url.lastPathComponent
+        var links: [RawLink] = []
+
+        // 1. Parse <a href="url">text</a>
+        let aPattern = try! NSRegularExpression(
+            pattern: #"<a\s[^>]*href\s*=\s*["'](https?://[^"']+)["'][^>]*>(.*?)</a>"#,
+            options: [.caseInsensitive, .dotMatchesLineSeparators])
+        let ns = html as NSString
+        for m in aPattern.matches(in: html, range: NSRange(location: 0, length: ns.length)) {
+            guard m.numberOfRanges > 2 else { continue }
+            let rawURL  = decodeHtmlEntities(ns.substring(with: m.range(at: 1)))
+                .trimmingCharacters(in: CharacterSet(charactersIn: ".,;:)>\"'"))
+            let rawText = ns.substring(with: m.range(at: 2))
+            let anchor  = stripHtmlTags(rawText).trimmingCharacters(in: .whitespacesAndNewlines)
+            if !rawURL.isEmpty {
+                links.append(RawLink(url: rawURL, source: filename, anchorText: anchor))
+            }
+        }
+
+        // 2. Raw URL scan for URLs not inside <a> tags
+        let captured = Set(links.map(\.url))
+        for rawURL in extractURLsFromText(html) where !captured.contains(rawURL) {
+            links.append(RawLink(url: rawURL, source: filename, anchorText: ""))
+        }
+
+        return links
+    }
+
+    private static func stripHtmlTags(_ html: String) -> String {
+        let pat = try! NSRegularExpression(pattern: "<[^>]+>", options: [])
+        let stripped = pat.stringByReplacingMatches(
+            in: html, range: NSRange(location: 0, length: (html as NSString).length), withTemplate: "")
+        return decodeHtmlEntities(stripped)
+    }
+}
+
+// ── RTF ──────────────────────────────────────────────────────────────────────
+
+struct RtfExtractor {
+    static func extract(from url: URL) throws -> [RawLink] {
+        guard let data = try? Data(contentsOf: url) else {
+            throw NSError(domain: "RtfExtractor", code: 1,
+                          userInfo: [NSLocalizedDescriptionKey: "Could not read RTF file."])
+        }
+
+        let filename = url.lastPathComponent
+        var links: [RawLink] = []
+        var capturedURLs = Set<String>()
+
+        // 1. NSAttributedString parses RTF natively and exposes .link attributes
+        if let attrStr = NSAttributedString(rtf: data, documentAttributes: nil) {
+            attrStr.enumerateAttribute(.link, in: NSRange(location: 0, length: attrStr.length)) { value, range, _ in
+                var urlStr: String?
+                if let u = value as? URL  { urlStr = u.absoluteString }
+                if let s = value as? String { urlStr = s }
+                guard let u = urlStr, u.hasPrefix("http") else { return }
+                let text = attrStr.attributedSubstring(from: range).string
+                links.append(RawLink(url: u, source: filename, anchorText: text))
+                capturedURLs.insert(u)
+            }
+
+            // Scan plain text for raw URLs
+            for rawURL in extractURLsFromText(attrStr.string) where !capturedURLs.contains(rawURL) {
+                links.append(RawLink(url: rawURL, source: filename, anchorText: ""))
+                capturedURLs.insert(rawURL)
+            }
+        }
+
+        // 2. Regex fallback on raw RTF source (catches HYPERLINK fields NSAttributedString may miss)
+        if let rtfStr = String(data: data, encoding: .ascii)
+                     ?? String(data: data, encoding: .utf8) {
+            let hlPattern = try! NSRegularExpression(
+                pattern: #"HYPERLINK\s+"(https?://[^"]+)""#, options: [])
+            let ns = rtfStr as NSString
+            for m in hlPattern.matches(in: rtfStr, range: NSRange(location: 0, length: ns.length)) {
+                guard m.numberOfRanges > 1 else { continue }
+                let u = ns.substring(with: m.range(at: 1))
+                if !capturedURLs.contains(u) {
+                    links.append(RawLink(url: u, source: filename, anchorText: ""))
+                    capturedURLs.insert(u)
+                }
+            }
+        }
+
+        return links
     }
 }
 
@@ -226,8 +412,9 @@ struct XLSXWriter {
          .replacingOccurrences(of: "'",  with: "&apos;")
     }
 
-    /// sheets: array of (sheetName, [url])
-    static func write(sheets: [(String, [String])], to outputURL: URL) throws {
+    /// sheets: array of (sheetName, [RawLink])
+    /// Columns: A = URL (blue underline), B = Source, C = Anchor Text
+    static func write(sheets: [(String, [RawLink])], to outputURL: URL) throws {
         let fm  = FileManager.default
         let tmp = fm.temporaryDirectory.appendingPathComponent(UUID().uuidString)
         defer { try? fm.removeItem(at: tmp) }
@@ -243,19 +430,24 @@ struct XLSXWriter {
 
         let n = sheets.count
 
-        // Shared string table
+        // ── Shared string table ──────────────────────────────────────
         var stringIndex: [String: Int] = [:]
         var allStrings:  [String]      = []
-        for (_, urls) in sheets {
-            for url in urls {
-                if stringIndex[url] == nil {
-                    stringIndex[url] = allStrings.count
-                    allStrings.append(url)
-                }
+        func addStr(_ s: String) {
+            if stringIndex[s] == nil { stringIndex[s] = allStrings.count; allStrings.append(s) }
+        }
+
+        // Headers first
+        addStr("URL"); addStr("Source"); addStr("Anchor Text")
+        for (_, links) in sheets {
+            for link in links {
+                addStr(link.url)
+                addStr(link.source)
+                if !link.anchorText.isEmpty { addStr(link.anchorText) }
             }
         }
 
-        // [Content_Types].xml
+        // ── [Content_Types].xml ──────────────────────────────────────
         let sheetCT = (0..<n).map { i in
             "  <Override PartName=\"/xl/worksheets/sheet\(i+1).xml\" " +
             "ContentType=\"application/vnd.openxmlformats-officedocument.spreadsheetml.worksheet+xml\"/>"
@@ -273,7 +465,7 @@ struct XLSXWriter {
 </Types>
 """)
 
-        // _rels/.rels
+        // ── _rels/.rels ──────────────────────────────────────────────
         try save(relsDir.appendingPathComponent(".rels"), """
 <?xml version="1.0" encoding="UTF-8" standalone="yes"?>
 <Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">
@@ -281,7 +473,7 @@ struct XLSXWriter {
 </Relationships>
 """)
 
-        // workbook.xml
+        // ── workbook.xml ─────────────────────────────────────────────
         let sheetsEl = (0..<n).map { i in
             let name = xmlEscape(String(sheets[i].0.prefix(31)))
             return "    <sheet name=\"\(name)\" sheetId=\"\(i+1)\" r:id=\"rId\(i+1)\"/>"
@@ -297,7 +489,7 @@ struct XLSXWriter {
 </workbook>
 """)
 
-        // workbook.xml.rels
+        // ── workbook.xml.rels ────────────────────────────────────────
         var relsEntries = (0..<n).map { i in
             "  <Relationship Id=\"rId\(i+1)\" " +
             "Type=\"http://schemas.openxmlformats.org/officeDocument/2006/relationships/worksheet\" " +
@@ -314,7 +506,7 @@ struct XLSXWriter {
 </Relationships>
 """)
 
-        // sharedStrings.xml
+        // ── sharedStrings.xml ────────────────────────────────────────
         let siEl = allStrings.map { s in
             "  <si><t xml:space=\"preserve\">\(xmlEscape(s))</t></si>"
         }.joined(separator: "\n")
@@ -326,13 +518,14 @@ struct XLSXWriter {
 </sst>
 """)
 
-        // styles.xml
+        // ── styles.xml (3 cell formats: normal, blue-link, bold-header) ──
         try save(xlDir.appendingPathComponent("styles.xml"), """
 <?xml version="1.0" encoding="UTF-8" standalone="yes"?>
 <styleSheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main">
-  <fonts count="2">
+  <fonts count="3">
     <font><sz val="11"/><name val="Calibri"/></font>
     <font><sz val="11"/><u/><color rgb="FF0563C1"/><name val="Calibri"/></font>
+    <font><sz val="11"/><b/><name val="Calibri"/></font>
   </fonts>
   <fills count="2">
     <fill><patternFill patternType="none"/></fill>
@@ -340,40 +533,65 @@ struct XLSXWriter {
   </fills>
   <borders count="1"><border><left/><right/><top/><bottom/><diagonal/></border></borders>
   <cellStyleXfs count="1"><xf numFmtId="0" fontId="0" fillId="0" borderId="0"/></cellStyleXfs>
-  <cellXfs count="2">
+  <cellXfs count="3">
     <xf numFmtId="0" fontId="0" fillId="0" borderId="0" xfId="0"/>
     <xf numFmtId="0" fontId="1" fillId="0" borderId="0" xfId="0"/>
+    <xf numFmtId="0" fontId="2" fillId="0" borderId="0" xfId="0"/>
   </cellXfs>
 </styleSheet>
 """)
 
-        // Worksheets
-        for (i, (_, urls)) in sheets.enumerated() {
-            let rows = urls.enumerated().map { (r, url) -> String in
-                let idx = stringIndex[url]!
-                return "    <row r=\"\(r+1)\"><c r=\"A\(r+1)\" t=\"s\" s=\"1\"><v>\(idx)</v></c></row>"
-            }.joined(separator: "\n")
+        // ── Worksheets ───────────────────────────────────────────────
+        for (i, (_, links)) in sheets.enumerated() {
+            var rows: [String] = []
+
+            // Header row (bold, s="2")
+            let hURL = stringIndex["URL"]!
+            let hSrc = stringIndex["Source"]!
+            let hAnc = stringIndex["Anchor Text"]!
+            rows.append("    <row r=\"1\"><c r=\"A1\" t=\"s\" s=\"2\"><v>\(hURL)</v></c>" +
+                        "<c r=\"B1\" t=\"s\" s=\"2\"><v>\(hSrc)</v></c>" +
+                        "<c r=\"C1\" t=\"s\" s=\"2\"><v>\(hAnc)</v></c></row>")
+
+            // Data rows
+            for (r, link) in links.enumerated() {
+                let row = r + 2
+                let uIdx = stringIndex[link.url]!
+                let sIdx = stringIndex[link.source]!
+                var xml  = "    <row r=\"\(row)\">"
+                xml += "<c r=\"A\(row)\" t=\"s\" s=\"1\"><v>\(uIdx)</v></c>"
+                xml += "<c r=\"B\(row)\" t=\"s\" s=\"0\"><v>\(sIdx)</v></c>"
+                if !link.anchorText.isEmpty, let aIdx = stringIndex[link.anchorText] {
+                    xml += "<c r=\"C\(row)\" t=\"s\" s=\"0\"><v>\(aIdx)</v></c>"
+                }
+                xml += "</row>"
+                rows.append(xml)
+            }
 
             try save(wsDir.appendingPathComponent("sheet\(i+1).xml"), """
 <?xml version="1.0" encoding="UTF-8" standalone="yes"?>
 <worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main">
-  <cols><col min="1" max="1" width="90" customWidth="1"/></cols>
+  <cols>
+    <col min="1" max="1" width="80" customWidth="1"/>
+    <col min="2" max="2" width="35" customWidth="1"/>
+    <col min="3" max="3" width="50" customWidth="1"/>
+  </cols>
   <sheetData>
-\(rows)
+\(rows.joined(separator: "\n"))
   </sheetData>
 </worksheet>
 """)
         }
 
-        // Zip it all up
+        // ── Zip → .xlsx ─────────────────────────────────────────────
         try? fm.removeItem(at: outputURL)
-        let proc = Process()
-        proc.executableURL       = URL(fileURLWithPath: "/usr/bin/zip")
-        proc.currentDirectoryURL = tmp
-        proc.arguments           = ["-r", outputURL.path, "."]
-        let ep = Pipe(); proc.standardError = ep
-        try proc.run(); proc.waitUntilExit()
-        guard proc.terminationStatus == 0 else {
+        let zipProc = Process()
+        zipProc.executableURL       = URL(fileURLWithPath: "/usr/bin/zip")
+        zipProc.currentDirectoryURL = tmp
+        zipProc.arguments           = ["-r", outputURL.path, "."]
+        let ep = Pipe(); zipProc.standardError = ep
+        try zipProc.run(); zipProc.waitUntilExit()
+        guard zipProc.terminationStatus == 0 else {
             let msg = String(data: ep.fileHandleForReading.readDataToEndOfFile(), encoding: .utf8) ?? ""
             throw NSError(domain: "XLSX", code: 1,
                           userInfo: [NSLocalizedDescriptionKey: "zip failed: \(msg)"])
@@ -382,6 +600,30 @@ struct XLSXWriter {
 
     private static func save(_ url: URL, _ content: String) throws {
         try content.write(to: url, atomically: true, encoding: .utf8)
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// MARK: - CSV Writer
+// ═══════════════════════════════════════════════════════════════════════════
+
+struct CSVWriter {
+    static func write(sheets: [(String, [RawLink])], to outputURL: URL) throws {
+        var lines: [String] = [csvLine(["URL", "Source", "Anchor Text", "File"])]
+        for (sheetName, links) in sheets {
+            for link in links {
+                lines.append(csvLine([link.url, link.source, link.anchorText, sheetName]))
+            }
+        }
+        try lines.joined(separator: "\n").write(to: outputURL, atomically: true, encoding: .utf8)
+    }
+
+    private static func csvLine(_ fields: [String]) -> String {
+        fields.map { f in
+            (f.contains(",") || f.contains("\"") || f.contains("\n"))
+                ? "\"" + f.replacingOccurrences(of: "\"", with: "\"\"") + "\""
+                : f
+        }.joined(separator: ",")
     }
 }
 
@@ -409,16 +651,27 @@ class AppState: ObservableObject {
             links = links.filter { seen.insert($0.url).inserted }
         }
         if !searchText.isEmpty {
-            links = links.filter { $0.url.localizedCaseInsensitiveContains(searchText) }
+            links = links.filter {
+                $0.url.localizedCaseInsensitiveContains(searchText) ||
+                $0.source.localizedCaseInsensitiveContains(searchText) ||
+                $0.anchorText.localizedCaseInsensitiveContains(searchText)
+            }
         }
         return links
     }
 
-    var dupesRemoved: Int {
-        guard deduplicate else { return 0 }
+    /// Number of extra duplicate occurrences across all links.
+    var dupeCount: Int {
         var seen = Set<String>()
-        let uniqueCount = allLinks.filter { seen.insert($0.url).inserted }.count
-        return allLinks.count - uniqueCount
+        let unique = allLinks.filter { seen.insert($0.url).inserted }.count
+        return allLinks.count - unique
+    }
+
+    /// URLs that appear more than once (for highlight mode).
+    var duplicateURLs: Set<String> {
+        var counts = [String: Int]()
+        for link in allLinks { counts[link.url, default: 0] += 1 }
+        return Set(counts.filter { $0.value > 1 }.keys)
     }
 
     var hasFile      : Bool { !loadedFiles.isEmpty }
@@ -443,10 +696,7 @@ class AppState: ObservableObject {
         let linkIDs = Set(file.links.map(\.id))
         selected.subtract(linkIDs)
         loadedFiles.removeAll { $0.id == file.id }
-        if loadedFiles.isEmpty {
-            statusMsg  = ""
-            searchText = ""
-        }
+        if loadedFiles.isEmpty { statusMsg = ""; searchText = "" }
     }
 
     func loadFiles(_ urls: [URL]) {
@@ -463,20 +713,22 @@ class AppState: ObservableObject {
 
             for url in newURLs {
                 do {
-                    let rawURLs: [String]
+                    let rawLinks: [RawLink]
                     switch url.pathExtension.lowercased() {
-                    case "docx": rawURLs = try DocxExtractor.extract(from: url)
-                    case "pdf":  rawURLs = try PDFExtractor.extract(from: url)
-                    case "pages":rawURLs = try PagesExtractor.extract(from: url)
-                    default:     rawURLs = []
+                    case "docx":         rawLinks = try DocxExtractor.extract(from: url)
+                    case "pdf":          rawLinks = try PDFExtractor.extract(from: url)
+                    case "pages":        rawLinks = try PagesExtractor.extract(from: url)
+                    case "html", "htm":  rawLinks = try HtmlExtractor.extract(from: url)
+                    case "rtf":          rawLinks = try RtfExtractor.extract(from: url)
+                    default:             rawLinks = []
                     }
 
-                    let links = rawURLs.map { ExtractedLink(url: $0) }
+                    let links = rawLinks.map {
+                        ExtractedLink(url: $0.url, source: $0.source, anchorText: $0.anchorText)
+                    }
                     newFiles.append(LoadedFile(
-                        url: url,
-                        name: url.lastPathComponent,
-                        type: url.pathExtension.lowercased(),
-                        links: links
+                        url: url, name: url.lastPathComponent,
+                        type: url.pathExtension.lowercased(), links: links
                     ))
                 } catch {
                     errors.append("\(url.lastPathComponent): \(error.localizedDescription)")
@@ -486,9 +738,7 @@ class AppState: ObservableObject {
             DispatchQueue.main.async {
                 self.loadedFiles.append(contentsOf: newFiles)
                 self.isLoading = false
-
-                // Select all new links (respecting current dedup/search)
-                self.selected = Set(self.displayedLinks.map(\.id))
+                self.selected  = Set(self.displayedLinks.map(\.id))
 
                 if !errors.isEmpty {
                     self.statusMsg = "Failed: " + errors.joined(separator: "; ")
@@ -504,35 +754,51 @@ class AppState: ObservableObject {
     }
 
     func copySelected() {
-        let urls = displayedLinks
-            .filter { selected.contains($0.id) }
-            .map(\.url)
-        guard !urls.isEmpty else {
-            statusMsg = "No URLs selected."
-            statusOK  = false
-            return
-        }
+        let urls = displayedLinks.filter { selected.contains($0.id) }.map(\.url)
+        guard !urls.isEmpty else { statusMsg = "No URLs selected."; statusOK = false; return }
         NSPasteboard.general.clearContents()
         NSPasteboard.general.setString(urls.joined(separator: "\n"), forType: .string)
         statusMsg = "\u{2713}  \(urls.count) URL\(urls.count == 1 ? "" : "s") copied to clipboard."
         statusOK  = true
     }
 
-    func export() {
+    // ── Shared sheet builder (used by xlsx & csv export) ─────────────
+    private func buildSheets() -> [(String, [RawLink])] {
         let selectedIDs = selected
-        guard !selectedIDs.isEmpty else {
-            statusMsg = "No URLs selected."
-            statusOK  = false
-            return
-        }
+        let dedup = deduplicate
+        var sheets: [(String, [RawLink])] = []
+        var usedNames = Set<String>()
 
-        let defaultName: String
-        if loadedFiles.count == 1 {
-            defaultName = URL(fileURLWithPath: loadedFiles[0].name)
-                .deletingPathExtension().lastPathComponent + "_links.xlsx"
-        } else {
-            defaultName = "links_batch.xlsx"
+        for file in loadedFiles {
+            var links = file.links.filter { selectedIDs.contains($0.id) }
+            if dedup {
+                var seen = Set<String>()
+                links = links.filter { seen.insert($0.url).inserted }
+            }
+            let rawLinks = links.map { RawLink(url: $0.url, source: $0.source, anchorText: $0.anchorText) }
+            guard !rawLinks.isEmpty else { continue }
+
+            let baseName = URL(fileURLWithPath: file.name)
+                .deletingPathExtension().lastPathComponent
+            var sheetName = String(baseName.prefix(31))
+            var counter = 2
+            while usedNames.contains(sheetName) {
+                let suffix = " (\(counter))"
+                sheetName = String(baseName.prefix(31 - suffix.count)) + suffix
+                counter += 1
+            }
+            usedNames.insert(sheetName)
+            sheets.append((sheetName, rawLinks))
         }
+        return sheets
+    }
+
+    func export() {
+        guard !selected.isEmpty else { statusMsg = "No URLs selected."; statusOK = false; return }
+
+        let defaultName = loadedFiles.count == 1
+            ? URL(fileURLWithPath: loadedFiles[0].name).deletingPathExtension().lastPathComponent + "_links.xlsx"
+            : "links_batch.xlsx"
 
         let panel = NSSavePanel()
         panel.title                = "Save Excel Workbook"
@@ -541,54 +807,57 @@ class AppState: ObservableObject {
         panel.canCreateDirectories = true
         guard panel.runModal() == .OK, let dest = panel.url else { return }
 
-        isLoading = true
-        statusMsg = ""
+        let sheets = buildSheets()
+        guard !sheets.isEmpty else { statusMsg = "No URLs to export."; statusOK = false; return }
 
-        let dedup = deduplicate
-        let files = loadedFiles
+        isLoading = true; statusMsg = ""
 
         DispatchQueue.global(qos: .userInitiated).async {
             do {
-                var sheets: [(String, [String])] = []
-                var usedNames = Set<String>()
-
-                for file in files {
-                    var links = file.links.filter { selectedIDs.contains($0.id) }
-                    if dedup {
-                        var seen = Set<String>()
-                        links = links.filter { seen.insert($0.url).inserted }
-                    }
-                    let urlStrings = links.map(\.url)
-                    guard !urlStrings.isEmpty else { continue }
-
-                    // Ensure unique sheet names (xlsx limit: 31 chars)
-                    let baseName = URL(fileURLWithPath: file.name)
-                        .deletingPathExtension().lastPathComponent
-                    var sheetName = String(baseName.prefix(31))
-                    var counter = 2
-                    while usedNames.contains(sheetName) {
-                        let suffix = " (\(counter))"
-                        sheetName = String(baseName.prefix(31 - suffix.count)) + suffix
-                        counter += 1
-                    }
-                    usedNames.insert(sheetName)
-                    sheets.append((sheetName, urlStrings))
-                }
-
-                guard !sheets.isEmpty else {
-                    DispatchQueue.main.async {
-                        self.isLoading = false
-                        self.statusMsg = "No URLs to export."
-                        self.statusOK  = false
-                    }
-                    return
-                }
-
                 try XLSXWriter.write(sheets: sheets, to: dest)
                 let total = sheets.reduce(0) { $0 + $1.1.count }
                 DispatchQueue.main.async {
                     self.isLoading = false
                     self.statusMsg = "\u{2713}  \(total) URL\(total == 1 ? "" : "s") exported across \(sheets.count) sheet\(sheets.count == 1 ? "" : "s")."
+                    self.statusOK  = true
+                    NSWorkspace.shared.activateFileViewerSelecting([dest])
+                }
+            } catch {
+                DispatchQueue.main.async {
+                    self.isLoading = false
+                    self.statusMsg = "Export failed: \(error.localizedDescription)"
+                    self.statusOK  = false
+                }
+            }
+        }
+    }
+
+    func exportCSV() {
+        guard !selected.isEmpty else { statusMsg = "No URLs selected."; statusOK = false; return }
+
+        let defaultName = loadedFiles.count == 1
+            ? URL(fileURLWithPath: loadedFiles[0].name).deletingPathExtension().lastPathComponent + "_links.csv"
+            : "links_batch.csv"
+
+        let panel = NSSavePanel()
+        panel.title                = "Save CSV File"
+        panel.nameFieldStringValue = defaultName
+        panel.allowedContentTypes  = [UTType(filenameExtension: "csv")!]
+        panel.canCreateDirectories = true
+        guard panel.runModal() == .OK, let dest = panel.url else { return }
+
+        let sheets = buildSheets()
+        guard !sheets.isEmpty else { statusMsg = "No URLs to export."; statusOK = false; return }
+
+        isLoading = true; statusMsg = ""
+
+        DispatchQueue.global(qos: .userInitiated).async {
+            do {
+                try CSVWriter.write(sheets: sheets, to: dest)
+                let total = sheets.reduce(0) { $0 + $1.1.count }
+                DispatchQueue.main.async {
+                    self.isLoading = false
+                    self.statusMsg = "\u{2713}  \(total) URL\(total == 1 ? "" : "s") exported as CSV."
                     self.statusOK  = true
                     NSWorkspace.shared.activateFileViewerSelecting([dest])
                 }
@@ -610,20 +879,15 @@ class AppState: ObservableObject {
 struct FileDrop: DropDelegate {
     let state: AppState
     let isTargeted: Binding<Bool>?
-    let allowed = ["docx","pdf","pages"]
+    let allowed = ["docx","pdf","pages","html","htm","rtf"]
 
     init(state: AppState, isTargeted: Binding<Bool>? = nil) {
         self.state      = state
         self.isTargeted = isTargeted
     }
 
-    func dropEntered(info: DropInfo) {
-        isTargeted?.wrappedValue = true
-    }
-
-    func dropExited(info: DropInfo) {
-        isTargeted?.wrappedValue = false
-    }
+    func dropEntered(info: DropInfo)  { isTargeted?.wrappedValue = true  }
+    func dropExited(info: DropInfo)   { isTargeted?.wrappedValue = false }
 
     func validateDrop(info: DropInfo) -> Bool {
         info.hasItemsConforming(to: [UTType.fileURL])
@@ -643,16 +907,14 @@ struct FileDrop: DropDelegate {
                 defer { group.leave() }
                 guard let d = data as? Data,
                       let url = URL(dataRepresentation: d, relativeTo: nil) else { return }
-                let ext = url.pathExtension.lowercased()
-                guard self.allowed.contains(ext) else { return }
-                collected.append(url)
+                if self.allowed.contains(url.pathExtension.lowercased()) {
+                    collected.append(url)
+                }
             }
         }
 
         group.notify(queue: .main) {
-            if !collected.isEmpty {
-                self.state.loadFiles(collected)
-            }
+            if !collected.isEmpty { self.state.loadFiles(collected) }
         }
         return true
     }
@@ -663,8 +925,9 @@ struct FileDrop: DropDelegate {
 // ═══════════════════════════════════════════════════════════════════════════
 
 struct LinkRow: View {
-    let link : ExtractedLink
+    let link        : ExtractedLink
     @Binding var isOn: Bool
+    let isDuplicate : Bool
 
     var body: some View {
         HStack(spacing: 10) {
@@ -672,32 +935,61 @@ struct LinkRow: View {
                 .toggleStyle(.checkbox)
                 .labelsHidden()
 
-            Text(link.url)
-                .font(.system(size: 12, design: .monospaced))
-                .foregroundColor(Color(red: 0.05, green: 0.4, blue: 0.85))
-                .lineLimit(1)
-                .truncationMode(.middle)
-                .frame(maxWidth: .infinity, alignment: .leading)
+            VStack(alignment: .leading, spacing: 2) {
+                Text(link.url)
+                    .font(.system(size: 12, design: .monospaced))
+                    .foregroundColor(Color(red: 0.05, green: 0.4, blue: 0.85))
+                    .lineLimit(1)
+                    .truncationMode(.middle)
+
+                HStack(spacing: 6) {
+                    if !link.source.isEmpty {
+                        Text(link.source)
+                            .font(.system(size: 10))
+                            .foregroundColor(.secondary)
+                            .lineLimit(1)
+                    }
+                    if !link.anchorText.isEmpty {
+                        Text("\u{2014} \(link.anchorText)")
+                            .font(.system(size: 10))
+                            .foregroundColor(Color(red: 0.35, green: 0.35, blue: 0.35))
+                            .lineLimit(1)
+                            .truncationMode(.tail)
+                    }
+                }
+            }
+            .frame(maxWidth: .infinity, alignment: .leading)
+
+            if isDuplicate {
+                Text("dupe")
+                    .font(.system(size: 9, weight: .semibold))
+                    .padding(.horizontal, 5)
+                    .padding(.vertical, 2)
+                    .background(Color.orange.opacity(0.15))
+                    .foregroundColor(.orange)
+                    .clipShape(Capsule())
+            }
         }
         .contentShape(Rectangle())
         .onTapGesture { isOn.toggle() }
         .contextMenu {
-            Button {
-                NSPasteboard.general.clearContents()
-                NSPasteboard.general.setString(link.url, forType: .string)
-            } label: {
-                Label("Copy URL", systemImage: "doc.on.doc")
+            Button { pasteboard(link.url) } label: { Label("Copy URL", systemImage: "doc.on.doc") }
+            if !link.anchorText.isEmpty {
+                Button { pasteboard(link.anchorText) } label: { Label("Copy Anchor Text", systemImage: "text.quote") }
             }
+            Divider()
             Button {
-                if let url = URL(string: link.url) {
-                    NSWorkspace.shared.open(url)
-                }
-            } label: {
-                Label("Open in Browser", systemImage: "safari")
-            }
+                if let url = URL(string: link.url) { NSWorkspace.shared.open(url) }
+            } label: { Label("Open in Browser", systemImage: "safari") }
         }
-        .padding(.vertical, 4)
+        .padding(.vertical, 5)
         .padding(.horizontal, 8)
+        .background(isDuplicate ? Color.orange.opacity(0.06) : Color.clear)
+    }
+
+    private func pasteboard(_ s: String) {
+        NSPasteboard.general.clearContents()
+        NSPasteboard.general.setString(s, forType: .string)
     }
 }
 
@@ -731,7 +1023,7 @@ struct DropZone: View {
                     .foregroundColor(isTargeted
                                      ? Color(red: 0.45, green: 0.65, blue: 1.0)
                                      : .secondary)
-                Text("Drop .pages, .pdf, or .docx files here")
+                Text("Drop .pdf, .docx, .pages, .html, or .rtf files here")
                     .font(.system(size: 13, weight: .medium))
                     .foregroundColor(isTargeted ? .primary : .secondary)
                 Text("or")
@@ -779,10 +1071,23 @@ struct ContentView: View {
 
     private func fmtColor(_ ext: String) -> Color {
         switch ext {
-        case "pdf":   return .red
-        case "docx":  return Color(red: 0.1, green: 0.4, blue: 0.85)
-        case "pages": return Color(red: 1.0, green: 0.55, blue: 0.0)
-        default:      return .secondary
+        case "pdf":          return .red
+        case "docx":         return Color(red: 0.1, green: 0.4, blue: 0.85)
+        case "pages":        return Color(red: 1.0, green: 0.55, blue: 0.0)
+        case "html", "htm":  return Color(red: 0.0, green: 0.6, blue: 0.5)
+        case "rtf":          return Color(red: 0.5, green: 0.3, blue: 0.7)
+        default:             return .secondary
+        }
+    }
+
+    private func fileIcon(_ ext: String) -> String {
+        switch ext {
+        case "pdf":          return "doc.richtext"
+        case "docx":         return "doc.text"
+        case "pages":        return "doc.text.image"
+        case "html", "htm":  return "globe"
+        case "rtf":          return "doc.plaintext"
+        default:             return "doc"
         }
     }
 
@@ -797,7 +1102,7 @@ struct ContentView: View {
                 VStack(alignment: .leading, spacing: 2) {
                     Text("Link Extractor")
                         .font(.system(size: 18, weight: .bold))
-                    Text("Extract all hyperlinks from .pages \u{00B7} .pdf \u{00B7} .docx \u{2192} Excel")
+                    Text("Extract hyperlinks from .pdf \u{00B7} .docx \u{00B7} .pages \u{00B7} .html \u{00B7} .rtf \u{2192} Excel / CSV")
                         .font(.system(size: 11))
                         .foregroundColor(.secondary)
                 }
@@ -809,197 +1114,199 @@ struct ContentView: View {
 
             Divider()
 
-            ScrollView {
-                VStack(spacing: 0) {
-
-                    // ── Drop Zone / File Chips ──────────────────────────
-                    VStack(alignment: .leading, spacing: 10) {
-                        if !state.hasFile {
-                            DropZone(isTargeted: $dropTargeted) { openFile() }
-                        } else {
-                            // File chips with horizontal scroll
-                            HStack(alignment: .top, spacing: 10) {
-                                ScrollView(.horizontal, showsIndicators: false) {
-                                    HStack(spacing: 8) {
-                                        ForEach(state.loadedFiles) { file in
-                                            fileChip(file)
-                                        }
-                                    }
-                                }
-                                Button("Add Files\u{2026}") { openFile() }
-                                    .buttonStyle(.bordered)
-                                    .controlSize(.small)
+            // ── Drop Zone / File Chips ──────────────────────────────────
+            VStack(alignment: .leading, spacing: 10) {
+                if !state.hasFile {
+                    DropZone(isTargeted: $dropTargeted) { openFile() }
+                } else {
+                    HStack(alignment: .top, spacing: 10) {
+                        ScrollView(.horizontal, showsIndicators: false) {
+                            HStack(spacing: 8) {
+                                ForEach(state.loadedFiles) { file in fileChip(file) }
                             }
                         }
+                        Button("Add Files\u{2026}") { openFile() }
+                            .buttonStyle(.bordered)
+                            .controlSize(.small)
                     }
-                    .padding(.horizontal, 22)
-                    .padding(.vertical, 16)
-
-                    Divider()
-
-                    // ── URL List ─────────────────────────────────────────
-                    VStack(alignment: .leading, spacing: 8) {
-                        HStack(spacing: 8) {
-                            Text("Extracted URLs")
-                                .font(.system(size: 13, weight: .semibold))
-
-                            if !state.allLinks.isEmpty {
-                                Badge(
-                                    text: "\(state.displayedLinks.count) URL\(state.displayedLinks.count == 1 ? "" : "s")",
-                                    color: accent
-                                )
-                                if state.dupesRemoved > 0 {
-                                    Badge(
-                                        text: "\(state.dupesRemoved) dupes removed",
-                                        color: .orange
-                                    )
-                                }
-                            }
-
-                            Spacer()
-
-                            if !state.displayedLinks.isEmpty {
-                                // Dedup toggle
-                                Toggle("Remove duplicates", isOn: Binding(
-                                    get: { state.deduplicate },
-                                    set: { _ in state.toggleDedup() }
-                                ))
-                                .toggleStyle(.checkbox)
-                                .font(.system(size: 11))
-                                .controlSize(.small)
-
-                                Divider().frame(height: 14)
-
-                                Button("All")  { state.selectAll()  }.controlSize(.mini)
-                                Button("None") { state.selectNone() }.controlSize(.mini)
-                            }
-                        }
-                        .buttonStyle(.bordered)
-
-                        // ── Search Bar ──────────────────────────────────
-                        if !state.allLinks.isEmpty {
-                            HStack(spacing: 6) {
-                                Image(systemName: "magnifyingglass")
-                                    .foregroundColor(.secondary)
-                                    .font(.system(size: 12))
-                                TextField("Filter URLs\u{2026}", text: $state.searchText)
-                                    .textFieldStyle(.plain)
-                                    .font(.system(size: 12))
-                                if !state.searchText.isEmpty {
-                                    Button(action: { state.searchText = "" }) {
-                                        Image(systemName: "xmark.circle.fill")
-                                            .foregroundColor(.secondary)
-                                            .font(.system(size: 12))
-                                    }
-                                    .buttonStyle(.plain)
-                                }
-                            }
-                            .padding(8)
-                            .background(Color(NSColor.controlBackgroundColor))
-                            .cornerRadius(6)
-                            .overlay(RoundedRectangle(cornerRadius: 6)
-                                .stroke(Color(NSColor.separatorColor), lineWidth: 0.5))
-                        }
-
-                        if state.isLoading {
-                            HStack { Spacer(); ProgressView("Scanning\u{2026}"); Spacer() }
-                                .frame(height: 200)
-                        } else if state.displayedLinks.isEmpty {
-                            HStack {
-                                Spacer()
-                                Text(state.hasFile
-                                     ? (state.searchText.isEmpty
-                                        ? (state.statusMsg.isEmpty ? "No URLs found." : state.statusMsg)
-                                        : "No URLs match your search.")
-                                     : "Open a file to see extracted URLs here\u{2026}")
-                                    .foregroundColor(.secondary)
-                                    .font(.system(size: 12))
-                                Spacer()
-                            }
-                            .frame(height: 200)
-                        } else {
-                            ScrollView(.vertical, showsIndicators: true) {
-                                LazyVStack(spacing: 0) {
-                                    ForEach(state.displayedLinks) { link in
-                                        LinkRow(
-                                            link: link,
-                                            isOn: Binding(
-                                                get: { state.selected.contains(link.id) },
-                                                set: { on in
-                                                    if on { state.selected.insert(link.id) }
-                                                    else  { state.selected.remove(link.id) }
-                                                }
-                                            )
-                                        )
-                                        Divider().padding(.leading, 34)
-                                    }
-                                }
-                            }
-                            .frame(height: 280)
-                            .background(Color(NSColor.controlBackgroundColor))
-                            .cornerRadius(8)
-                            .overlay(RoundedRectangle(cornerRadius: 8)
-                                .stroke(Color(NSColor.separatorColor), lineWidth: 0.5))
-
-                            let selectedDisplayed = state.displayedLinks.filter { state.selected.contains($0.id) }.count
-                            Text("\(selectedDisplayed) of \(state.displayedLinks.count) selected")
-                                .font(.system(size: 11))
-                                .foregroundColor(.secondary)
-                        }
-                    }
-                    .padding(.horizontal, 22)
-                    .padding(.vertical, 14)
-
-                    Divider()
-
-                    // ── Export Bar ───────────────────────────────────────
-                    HStack(spacing: 14) {
-                        Button {
-                            state.export()
-                        } label: {
-                            HStack(spacing: 6) {
-                                Image(systemName: "tablecells")
-                                Text("Export to Excel (.xlsx)\u{2026}")
-                                    .fontWeight(.semibold)
-                            }
-                            .frame(minWidth: 210)
-                        }
-                        .buttonStyle(.borderedProminent)
-                        .tint(green)
-                        .controlSize(.large)
-                        .disabled(!state.hasFile || state.selectedCount == 0 || state.isLoading)
-
-                        Button {
-                            state.copySelected()
-                        } label: {
-                            HStack(spacing: 6) {
-                                Image(systemName: "doc.on.doc")
-                                Text("Copy")
-                            }
-                        }
-                        .buttonStyle(.bordered)
-                        .controlSize(.large)
-                        .disabled(!state.hasFile || state.selectedCount == 0 || state.isLoading)
-
-                        if !state.statusMsg.isEmpty {
-                            Text(state.statusMsg)
-                                .font(.system(size: 12))
-                                .foregroundColor(state.statusOK ? green : .red)
-                                .lineLimit(2)
-                                .fixedSize(horizontal: false, vertical: true)
-                        }
-                        Spacer()
-                    }
-                    .padding(.horizontal, 22)
-                    .padding(.vertical, 16)
                 }
             }
+            .padding(.horizontal, 22)
+            .padding(.vertical, 16)
+
+            Divider()
+
+            // ── URL List section (flexible height) ──────────────────────
+            VStack(alignment: .leading, spacing: 8) {
+                HStack(spacing: 8) {
+                    Text("Extracted URLs")
+                        .font(.system(size: 13, weight: .semibold))
+
+                    if !state.allLinks.isEmpty {
+                        Badge(
+                            text: "\(state.displayedLinks.count) URL\(state.displayedLinks.count == 1 ? "" : "s")",
+                            color: accent
+                        )
+                        if state.dupeCount > 0 {
+                            Badge(
+                                text: state.deduplicate
+                                    ? "\(state.dupeCount) dupes removed"
+                                    : "\(state.dupeCount) duplicate\(state.dupeCount == 1 ? "" : "s")",
+                                color: .orange
+                            )
+                        }
+                    }
+
+                    Spacer()
+
+                    if !state.displayedLinks.isEmpty {
+                        Toggle(state.deduplicate ? "Remove duplicates" : "Highlight duplicates",
+                               isOn: Binding(
+                                   get: { state.deduplicate },
+                                   set: { _ in state.toggleDedup() }
+                               ))
+                        .toggleStyle(.checkbox)
+                        .font(.system(size: 11))
+                        .controlSize(.small)
+
+                        Divider().frame(height: 14)
+
+                        Button("All")  { state.selectAll()  }.controlSize(.mini)
+                        Button("None") { state.selectNone() }.controlSize(.mini)
+                    }
+                }
+                .buttonStyle(.bordered)
+
+                // ── Search Bar ──────────────────────────────────────────
+                if !state.allLinks.isEmpty {
+                    HStack(spacing: 6) {
+                        Image(systemName: "magnifyingglass")
+                            .foregroundColor(.secondary)
+                            .font(.system(size: 12))
+                        TextField("Search\u{2026}", text: $state.searchText)
+                            .textFieldStyle(.plain)
+                            .font(.system(size: 12))
+                        if !state.searchText.isEmpty {
+                            Button(action: { state.searchText = "" }) {
+                                Image(systemName: "xmark.circle.fill")
+                                    .foregroundColor(.secondary)
+                                    .font(.system(size: 12))
+                            }
+                            .buttonStyle(.plain)
+                        }
+                    }
+                    .padding(8)
+                    .background(Color(NSColor.controlBackgroundColor))
+                    .cornerRadius(6)
+                    .overlay(RoundedRectangle(cornerRadius: 6)
+                        .stroke(Color(NSColor.separatorColor), lineWidth: 0.5))
+                }
+
+                // ── URL list / empty state ──────────────────────────────
+                if state.isLoading {
+                    HStack { Spacer(); ProgressView("Scanning\u{2026}"); Spacer() }
+                        .frame(maxWidth: .infinity, maxHeight: .infinity)
+                } else if state.displayedLinks.isEmpty {
+                    HStack {
+                        Spacer()
+                        Text(state.hasFile
+                             ? (state.searchText.isEmpty
+                                ? (state.statusMsg.isEmpty ? "No URLs found." : state.statusMsg)
+                                : "No URLs match your search.")
+                             : "Open a file to see extracted URLs here\u{2026}")
+                            .foregroundColor(.secondary)
+                            .font(.system(size: 12))
+                        Spacer()
+                    }
+                    .frame(maxWidth: .infinity, maxHeight: .infinity)
+                } else {
+                    let dupes = state.deduplicate ? Set<String>() : state.duplicateURLs
+                    ScrollView(.vertical, showsIndicators: true) {
+                        LazyVStack(spacing: 0) {
+                            ForEach(state.displayedLinks) { link in
+                                LinkRow(
+                                    link: link,
+                                    isOn: Binding(
+                                        get: { state.selected.contains(link.id) },
+                                        set: { on in
+                                            if on { state.selected.insert(link.id) }
+                                            else  { state.selected.remove(link.id) }
+                                        }
+                                    ),
+                                    isDuplicate: dupes.contains(link.url)
+                                )
+                                Divider().padding(.leading, 34)
+                            }
+                        }
+                    }
+                    .background(Color(NSColor.controlBackgroundColor))
+                    .cornerRadius(8)
+                    .overlay(RoundedRectangle(cornerRadius: 8)
+                        .stroke(Color(NSColor.separatorColor), lineWidth: 0.5))
+
+                    let selDisp = state.displayedLinks.filter { state.selected.contains($0.id) }.count
+                    Text("\(selDisp) of \(state.displayedLinks.count) selected")
+                        .font(.system(size: 11))
+                        .foregroundColor(.secondary)
+                }
+            }
+            .padding(.horizontal, 22)
+            .padding(.vertical, 14)
+            .frame(maxHeight: .infinity)
+
+            Divider()
+
+            // ── Export Bar ───────────────────────────────────────────────
+            HStack(spacing: 10) {
+                Button { state.export() } label: {
+                    HStack(spacing: 6) {
+                        Image(systemName: "tablecells")
+                        Text("Export .xlsx\u{2026}")
+                            .fontWeight(.semibold)
+                    }
+                }
+                .buttonStyle(.borderedProminent)
+                .tint(green)
+                .controlSize(.large)
+                .disabled(!state.hasFile || state.selectedCount == 0 || state.isLoading)
+
+                Button { state.exportCSV() } label: {
+                    HStack(spacing: 6) {
+                        Image(systemName: "doc.text")
+                        Text("Export .csv\u{2026}")
+                    }
+                }
+                .buttonStyle(.bordered)
+                .controlSize(.large)
+                .disabled(!state.hasFile || state.selectedCount == 0 || state.isLoading)
+
+                Button { state.copySelected() } label: {
+                    HStack(spacing: 6) {
+                        Image(systemName: "doc.on.doc")
+                        Text("Copy")
+                    }
+                }
+                .buttonStyle(.bordered)
+                .controlSize(.large)
+                .disabled(!state.hasFile || state.selectedCount == 0 || state.isLoading)
+
+                if !state.statusMsg.isEmpty {
+                    Text(state.statusMsg)
+                        .font(.system(size: 12))
+                        .foregroundColor(state.statusOK ? green : .red)
+                        .lineLimit(2)
+                        .fixedSize(horizontal: false, vertical: true)
+                }
+                Spacer()
+            }
+            .padding(.horizontal, 22)
+            .padding(.vertical, 16)
         }
-        .frame(width: 560)
+        .frame(minWidth: 520, minHeight: 480)
         .onDrop(of: [UTType.fileURL], delegate: FileDrop(state: state, isTargeted: $dropTargeted))
     }
 
-    // ── File Chip ───────────────────────────────────────────────────────
+    // ── File Chip ────────────────────────────────────────────────────
     private func fileChip(_ file: LoadedFile) -> some View {
         HStack(spacing: 6) {
             Image(systemName: fileIcon(file.type))
@@ -1026,25 +1333,19 @@ struct ContentView: View {
             .stroke(fmtColor(file.type).opacity(0.4), lineWidth: 1))
     }
 
-    private func fileIcon(_ ext: String) -> String {
-        switch ext {
-        case "pdf":   return "doc.richtext"
-        case "docx":  return "doc.text"
-        case "pages": return "doc.text.image"
-        default:      return "doc"
-        }
-    }
-
     private func openFile() {
         let panel = NSOpenPanel()
         panel.title                   = "Select Documents"
-        panel.message                 = "Choose .pages, .pdf, or .docx files"
+        panel.message                 = "Choose .pdf, .docx, .pages, .html, or .rtf files"
         panel.allowsMultipleSelection = true
         panel.canChooseDirectories    = false
         panel.allowedContentTypes     = [
             UTType(filenameExtension: "pdf")!,
             UTType(filenameExtension: "docx")!,
             UTType(filenameExtension: "pages")!,
+            UTType(filenameExtension: "html")!,
+            UTType(filenameExtension: "htm")!,
+            UTType(filenameExtension: "rtf")!,
         ]
         if panel.runModal() == .OK, !panel.urls.isEmpty {
             state.loadFiles(panel.urls)
@@ -1062,12 +1363,13 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     func applicationDidFinishLaunching(_ n: Notification) {
         NSApp.setActivationPolicy(.regular)
         window = NSWindow(
-            contentRect: NSRect(x: 0, y: 0, width: 560, height: 620),
-            styleMask:   [.titled, .closable, .miniaturizable],
+            contentRect: NSRect(x: 0, y: 0, width: 620, height: 680),
+            styleMask:   [.titled, .closable, .miniaturizable, .resizable],
             backing:     .buffered,
             defer:       false
         )
         window.title       = "Link Extractor"
+        window.minSize     = NSSize(width: 520, height: 480)
         window.contentView = NSHostingView(rootView: ContentView())
         window.isReleasedWhenClosed = false
         window.center()
