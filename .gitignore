@@ -1,0 +1,7 @@
+# Build output
+LinkExtractor.app/
+
+# macOS
+.DS_Store
+*.swp
+*~
