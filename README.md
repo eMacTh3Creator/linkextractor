@@ -55,7 +55,32 @@ Trailing punctuation (`,` `.` `;` `:` `)` `>` `"` `'`) is stripped automatically
 
 ---
 
-## Build
+## Install (pre-built release)
+
+Download the latest `.zip` from [Releases](https://github.com/eMacTh3Creator/linkextractor/releases), unzip it, then run the included install script:
+
+```bash
+cd ~/Downloads/LinkExtractor-v2.0-arm64   # or wherever you unzipped
+chmod +x install.sh
+./install.sh
+```
+
+The script strips the macOS quarantine flag (required for unsigned apps downloaded from the internet) and optionally copies the app to `/Applications`.
+
+**Manual alternative** — if you prefer not to use the script:
+
+```bash
+xattr -dr com.apple.quarantine LinkExtractor.app
+open LinkExtractor.app
+```
+
+Or: right-click the app → **Open** → click **Open** in the dialog. If macOS still blocks it, go to **System Settings → Privacy & Security**, scroll down, and click **Open Anyway**.
+
+> **Why is this needed?** The app is compiled from source with no Apple Developer ID signature. macOS Gatekeeper quarantines all unsigned apps downloaded from the internet. The `xattr` command removes that quarantine flag.
+
+---
+
+## Build from source
 
 ```bash
 # 1. Install Xcode Command Line Tools if needed
